@@ -2,6 +2,11 @@
 
 Input: local JSONL records {"text": "..."}. Concatenate with EOS, chunk into
 unpadded fixed-length causal sequences. All workers need BLOOMBEE_ENABLE_LORA=1.
+
+Data parallel training: start one copy of this script per trainer with the same --dp_run_id,
+--world_size N and a distinct --rank 0..N-1 (same --seed so all start from identical weights).
+Rows are sharded round-robin by rank, LoRA gradients are all-reduced every optimizer step, and
+checkpoints are written per rank under <output>/checkpoint-N/rank-R. Rank 0 writes the final adapter.
 """
 
 import argparse
@@ -14,6 +19,7 @@ import torch
 from transformers import AutoTokenizer
 
 from bloombee import AutoDistributedModelForCausalLM, DistributedLoRA, LoRAConfig
+from bloombee.client.lora_data_parallel import LoRADataParallel, shard_rows
 
 
 def main():
@@ -32,18 +38,38 @@ def main():
     parser.add_argument("--seq_len", type=int, default=128)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument(
+        "--micro_batch_size",
+        type=int,
+        default=None,
+        help="Split each batch into chunks of this many rows and run them concurrently over replica routes",
+    )
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--r", type=int, default=8)
     parser.add_argument("--lora_alpha", type=float, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.0)
     parser.add_argument("--target_modules", nargs="+", default=["q_proj", "v_proj"])
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--init_seed", type=int, default=None, help="Adapter init seed (default: --seed)")
+    dp = parser.add_argument_group("data parallel (multiple trainers)")
+    dp.add_argument("--world_size", type=int, default=1, help="Number of trainers")
+    dp.add_argument("--rank", type=int, default=0, help="This trainer's index in 0..world_size-1")
+    dp.add_argument("--dp_run_id", help="Shared id of this training run (required when world_size > 1)")
+    dp.add_argument("--dp_timeout", type=float, default=300, help="Seconds to wait for all trainers each step")
+    dp.add_argument("--dp_matchmaking_time", type=float, default=2.0, help="Seconds the group waits for stragglers")
+    dp.add_argument("--dp_check_every", type=int, default=50, help="Steps between weight-consistency checks (0=never)")
+    dp.add_argument("--dp_overlap", action="store_true", help="Start matchmaking before forward/backward")
     args = parser.parse_args()
     if min(args.steps, args.batch_size, args.gradient_accumulation_steps) < 1 or args.seq_len < 2:
         raise ValueError("steps, batch and accumulation must be positive; seq_len must be >=2")
     if args.checkpoint_every < 0:
         raise ValueError("checkpoint_every must be nonnegative")
-    torch.manual_seed(args.seed)
+    if args.world_size < 1 or not 0 <= args.rank < args.world_size:
+        raise ValueError("Need 0 <= rank < world_size")
+    distributed = args.world_size > 1
+    if distributed and not args.dp_run_id:
+        raise ValueError("--dp_run_id is required when --world_size > 1")
+    torch.manual_seed(args.init_seed if args.init_seed is not None else args.seed)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     tokens = []
     for line in args.data.read_text().splitlines():
@@ -57,6 +83,9 @@ def main():
     if count < 1:
         raise ValueError("Dataset is shorter than one unpadded seq_len chunk")
     chunks = torch.tensor(tokens[: count * args.seq_len]).view(count, args.seq_len)
+    local_rows = torch.tensor(list(shard_rows(count, args.rank, args.world_size)), dtype=torch.long)
+    if len(local_rows) < 1:
+        raise ValueError(f"Dataset has {count} chunks, fewer than world_size={args.world_size}")
     training_config = dict(
         model=args.model,
         device=args.device,
@@ -66,16 +95,26 @@ def main():
         lr=args.lr,
         tokens_sha256=hashlib.sha256(chunks.numpy().tobytes()).hexdigest(),
     )
+    if distributed:  # single-trainer checkpoints keep their original format and stay resumable
+        training_config.update(world_size=args.world_size, rank=args.rank)
+    # Data parallel: every rank checkpoints into its own subdirectory (adapters are tiny; RNG is per rank).
+    def checkpoint_path(step):
+        base = args.output / f"checkpoint-{step}"
+        return base / f"rank-{args.rank}" if distributed else base
+
+    resume_dir = args.resume_checkpoint
+    if resume_dir is not None and distributed:
+        resume_dir = resume_dir / f"rank-{args.rank}"
     losses, start_step = [], 0
     if args.resume_checkpoint:
-        saved = torch.load(args.resume_checkpoint / "training_state.pt", map_location="cpu", weights_only=True)
+        saved = torch.load(resume_dir / "training_state.pt", map_location="cpu", weights_only=True)
         if saved["metadata"]["training_config"] != training_config:
             raise ValueError("Resume requires the same model, tokenized data, device and training settings")
         start_step, losses = saved["step"], saved["metadata"]["losses"]
         if args.steps < start_step:
             raise ValueError("steps is the total target step count and cannot precede the checkpoint")
         del saved
-    if (args.output / f"checkpoint-{args.steps}").exists():
+    if checkpoint_path(args.steps).exists():
         raise FileExistsError("Use a fresh output directory; final checkpoint already exists")
     kwargs = dict(
         initial_peers=args.initial_peers,
@@ -88,46 +127,78 @@ def main():
         kwargs["dht_prefix"] = args.dht_prefix
     base = AutoDistributedModelForCausalLM.from_pretrained(args.model, **kwargs).to(args.device)
     if args.resume_adapter or args.resume_checkpoint:
-        model = DistributedLoRA.from_pretrained(base, args.resume_adapter or args.resume_checkpoint)
+        model = DistributedLoRA.from_pretrained(
+            base, args.resume_adapter or resume_dir, micro_batch_size=args.micro_batch_size
+        )
     else:
         model = DistributedLoRA(
-            base, LoRAConfig(args.r, args.lora_alpha, args.lora_dropout, tuple(args.target_modules))
+            base,
+            LoRAConfig(args.r, args.lora_alpha, args.lora_dropout, tuple(args.target_modules)),
+            micro_batch_size=args.micro_batch_size,
         )
     model.to(args.device).train()
     parameters = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(parameters, lr=args.lr)
     start = time.perf_counter()
+    dp = None
     try:
         if args.resume_checkpoint:
-            model.load_training_state(args.resume_checkpoint, optimizer)
+            model.load_training_state(resume_dir, optimizer)
+        if distributed:
+            dp = LoRADataParallel.for_model(
+                model,
+                run_id=args.dp_run_id,
+                rank=args.rank,
+                world_size=args.world_size,
+                initial_peers=args.initial_peers,
+                timeout=args.dp_timeout,
+                matchmaking_time=args.dp_matchmaking_time,
+            )
+            dp.sync_initial_state()  # barrier; raises if the trainers did not start from the same weights
+            if not args.resume_checkpoint:
+                torch.manual_seed(args.seed + args.rank)  # same init everywhere, different data/dropout per rank
         for step in range(start_step, args.steps):
             optimizer.zero_grad(set_to_none=True)
+            if dp is not None and args.dp_overlap:
+                dp.begin_round()
             mean_loss = 0.0
             for _ in range(args.gradient_accumulation_steps):
-                ids = chunks[torch.randint(count, (args.batch_size,), device="cpu")].to(args.device)
+                ids = chunks[local_rows[torch.randint(len(local_rows), (args.batch_size,), device="cpu")]].to(
+                    args.device
+                )
                 output = model(input_ids=ids, labels=ids, use_cache=False)
                 (output.loss / args.gradient_accumulation_steps).backward()
                 mean_loss += float(output.loss.detach()) / args.gradient_accumulation_steps
+            if dp is not None:  # token-weighted mean gradient (and loss) over all trainers
+                tokens_in_step = args.batch_size * args.gradient_accumulation_steps * (args.seq_len - 1)
+                mean_loss = dp.allreduce_gradients(tokens_in_step, loss=mean_loss)
             norm = torch.nn.utils.clip_grad_norm_(parameters, max_norm=1.0, error_if_nonfinite=True)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            if dp is not None:
+                dp.maybe_check_consistency(step, args.dp_check_every)
             losses.append(mean_loss)
             completed = step + 1
-            print(f"step={completed} loss={mean_loss:.6f} grad_norm={float(norm):.6f}", flush=True)
+            prefix = f"[rank {args.rank}] " if distributed else ""
+            print(f"{prefix}step={completed} loss={mean_loss:.6f} grad_norm={float(norm):.6f}", flush=True)
             if completed == args.steps or (args.checkpoint_every and completed % args.checkpoint_every == 0):
                 model.save_training_checkpoint(
-                    args.output / f"checkpoint-{completed}",
+                    checkpoint_path(completed),
                     optimizer,
                     step=completed,
                     metadata=dict(training_config=training_config, losses=losses),
                 )
+        if dp is not None:
+            dp.check_consistency()  # final drift check + snap, so the saved adapters agree across ranks
         if start_step == args.steps:
             model.save_training_checkpoint(
-                args.output / f"checkpoint-{start_step}",
+                checkpoint_path(start_step),
                 optimizer,
                 step=start_step,
                 metadata=dict(training_config=training_config, losses=losses),
             )
+        if args.rank != 0:  # adapters agree across ranks; rank 0 writes the shared final output
+            return
         model.save_pretrained(args.output)
         (args.output / "training.json").write_text(
             json.dumps(
@@ -138,6 +209,7 @@ def main():
                     "trainable_parameters": sum(p.numel() for p in parameters),
                     "elapsed_s": time.perf_counter() - start,
                     "seed": args.seed,
+                    "world_size": args.world_size,
                     "gradient_accumulation_steps": args.gradient_accumulation_steps,
                 },
                 indent=2,
@@ -145,6 +217,8 @@ def main():
             + "\n"
         )
     finally:
+        if dp is not None:
+            dp.shutdown()
         model.remote_layers.sequence_manager.shutdown()
 
 

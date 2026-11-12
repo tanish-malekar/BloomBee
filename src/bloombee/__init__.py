@@ -33,4 +33,5 @@ _initialize_logs()
 _override_bfloat16_mode_default()
 
 from bloombee.client.lora import DistributedLoRA
+from bloombee.client.lora_data_parallel import LoRADataParallel, LoRADataParallelError
 from bloombee.utils.lora import LoRAConfig

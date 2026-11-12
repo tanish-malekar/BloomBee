@@ -206,6 +206,8 @@ def test_fp32_client_fp16_worker_casts_forward_and_gradients():
 
 
 def test_remote_autograd_runs_for_frozen_inputs_and_detects_early_update(monkeypatch):
+    from types import SimpleNamespace
+
     from bloombee.client import lora as client
 
     async def local_call(manager, span, tensors, metadata):
@@ -215,14 +217,24 @@ def test_remote_autograd_runs_for_frozen_inputs_and_detects_early_update(monkeyp
             y = x + torch.nn.functional.linear(torch.nn.functional.linear(x, a), b)
             return list(torch.autograd.grad(y, (x, a, b), tensors[3])) if backward else [y.detach()]
 
+    class Manager:
+        config = SimpleNamespace(max_retries=1)
+
+        def make_sequence(self, start, end, *, mode, peer_load=None):
+            return [SimpleNamespace(peer_id="p", start=start, end=end)]
+
+        def on_request_success(self, peer):
+            pass
+
     monkeypatch.setattr(client, "_call_lora", local_call)
+    runner = client._LoRARunner(Manager(), num_layers=1, width=2)
     x = torch.randn(1, 3, 4)  # Frozen embedding, no gradient anchor necessary.
     a, b = nn.Parameter(torch.randn(2, 4)), nn.Parameter(torch.randn(4, 2))
-    y = client._RemoteLoRAFunction.apply(x, None, None, {}, a, b)
+    y = client._RemoteLoRASequenceFunction.apply(x, runner, None, {}, a, b)
     assert y.requires_grad
     y.square().mean().backward()
     assert a.grad.norm() > 0 and b.grad.norm() > 0
-    stale = client._RemoteLoRAFunction.apply(x, None, None, {}, a, b)
+    stale = client._RemoteLoRASequenceFunction.apply(x, runner, None, {}, a, b)
     with torch.no_grad():
         b.add_(0.01)
     with pytest.raises(RuntimeError, match="modified by an inplace operation"):
