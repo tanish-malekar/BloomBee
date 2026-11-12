@@ -158,6 +158,11 @@ def sample_top_p(probs, p):
 #         else:
 #             raise ValueError(f"Invalid name: {name}")
 
+def _on_accelerator(t):
+    """True for tensors on a GPU-like device (CUDA or Apple MPS), False for CPU tensors."""
+    return t.device.type in ("cuda", "mps")
+
+
 class TorchTensor:
     """
     Wrap pytorch tensors to support
@@ -613,14 +618,15 @@ class TorchDevice:
                 k = k.permute(1, 2, 0).reshape(b * num_attention_heads, head_dim, src_s)
                 # shape: (b * num_attention_heads, s, head_dim)
                 v = v.permute(1, 0, 2).reshape(b * num_attention_heads, src_s, head_dim)
-                if k.is_cuda:
+                if _on_accelerator(k):
                     value = self._attention_value(q, k, v, attention_mask.data,
                         b, src_s, tgt_s, num_attention_heads, head_dim)
                 else:
+                    q_device = q.device
                     q = q.float().cpu()
                     k, v = k.float(), v.float()
                     value = self._attention_value(q, k, v, attention_mask.data,
-                        b, src_s, tgt_s, num_attention_heads, head_dim).cuda().half()
+                        b, src_s, tgt_s, num_attention_heads, head_dim).to(q_device).half()
             else:  # Sparse attention
                 # shape: (s, b * num_attention_heads, head_dim)
                 k = k_cache.data[:src_s]
@@ -628,15 +634,16 @@ class TorchDevice:
                 # shape: (b * num_attention_heads, head_dim, s)
                 k = k.permute(1, 2, 0).reshape(b * num_attention_heads, head_dim, src_s)
 
-                if k.is_cuda:
+                if _on_accelerator(k):
                     value = self._sparse_attention_value(q, k, v_new, v_cache,
                         attention_mask.data, b, src_s, tgt_s, num_attention_heads, head_dim,
                         attn_sparsity)
                 else:
+                    q_device = q.device
                     q = q.float().cpu()
                     value = self._sparse_attention_value(q, k, v_new, v_cache,
                         attention_mask.data, b, src_s, tgt_s, num_attention_heads, head_dim,
-                        attn_sparsity).cuda().half()
+                        attn_sparsity).to(q_device).half()
         else:  # Mixed device attention
             assert attn_sparsity >= 1.0
             value = self._mixed_device_attention(q, k_cache, v_cache,
@@ -877,7 +884,7 @@ class TorchDevice:
                 k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
                 # shape: (b * n_head, s, head_dim)
                 v = v.permute(1, 0, 2).reshape(b * n_head, src_s, head_dim)
-                if k.is_cuda:
+                if _on_accelerator(k):
                     if not _MHA_GEN_DECODE_BRANCH_PROBE_EMITTED:
                         logger.info("[CACHE_PATH_BRANCH] decode_branch=dense_cuda")
                         _MHA_GEN_DECODE_BRANCH_PROBE_EMITTED = True
@@ -887,10 +894,11 @@ class TorchDevice:
                     if not _MHA_GEN_DECODE_BRANCH_PROBE_EMITTED:
                         logger.info("[CACHE_PATH_BRANCH] decode_branch=dense_cpu")
                         _MHA_GEN_DECODE_BRANCH_PROBE_EMITTED = True
+                    q_device = q.device
                     q = q.float().cpu()
                     k, v = k.float(), v.float()
                     value = self._attention_value(q, k, v, attention_mask.data,
-                        b, src_s, tgt_s, n_head, head_dim).cuda().half()
+                        b, src_s, tgt_s, n_head, head_dim).to(q_device).half()
                         
             else:  # Sparse attention
                 # shape: (s, b * n_head, head_dim)
@@ -899,15 +907,16 @@ class TorchDevice:
                 # shape: (b * n_head, head_dim, s)
                 k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
 
-                if k.is_cuda:
+                if _on_accelerator(k):
                     value = self._sparse_attention_value(q, k, v_new, v_cache,
                         attention_mask.data, b, src_s, tgt_s, n_head, head_dim,
                         attn_sparsity)
                 else:
+                    q_device = q.device
                     q = q.float().cpu()
                     value = self._sparse_attention_value(q, k, v_new, v_cache,
                         attention_mask.data, b, src_s, tgt_s, n_head, head_dim,
-                        attn_sparsity).cuda().half()
+                        attn_sparsity).to(q_device).half()
         else:  # Mixed device attention
             assert attn_sparsity >= 1.0
             if not _MHA_GEN_DECODE_BRANCH_PROBE_EMITTED:
@@ -994,7 +1003,7 @@ class TorchDevice:
         attn_weights = torch.cat([topk_weights,
             attn_weights[:, :, -1].unsqueeze(-1)], dim=-1)
 
-        if k.is_cuda:
+        if _on_accelerator(k):
             v_home = v_cache
             v_buf = self.allocate((topk+1, b*n_head, head_dim), np.float16)
             topk_indices = topk_indices.cpu()
@@ -1038,7 +1047,7 @@ class TorchDevice:
         # shape: (b * n_head, s, head_dim)
         v_gpu = v_gpu.permute(1, 0, 2)
 
-        mask_gpu = mask[:b_gpu].cuda()
+        mask_gpu = mask[:b_gpu].to(q_gpu.device)
         value_gpu = self._attention_value(q_gpu, k_gpu, v_gpu, mask_gpu,
             b_gpu, src_s, tgt_s, n_head, head_dim)
 
@@ -1059,7 +1068,7 @@ class TorchDevice:
         value_cpu = self._attention_value(q_cpu, k_cpu, v_cpu, mask_cpu,
             b_cpu, src_s, tgt_s, n_head, head_dim)
 
-        value = torch.cat([value_gpu, value_cpu.cuda().half()], dim=0)
+        value = torch.cat([value_gpu, value_cpu.to(value_gpu.device).half()], dim=0)
         return value
 
     def mlp(self, inputs, wi, bi, wo, bo, w_ln, b_ln, donate):
@@ -1104,12 +1113,18 @@ class TorchDevice:
         return TorchTensor.create_from_torch(out, self)
 
     def synchronize(self):
-        torch.cuda.synchronize()
+        if self.device_type == DeviceType.MPS:
+            torch.mps.synchronize()
+        elif torch.cuda.is_available():
+            torch.cuda.synchronize()
 
     def mem_stats(self):
         if self.device_type == DeviceType.CUDA:
             cur_mem = torch.cuda.memory_allocated(self.dev)
             peak_mem = torch.cuda.max_memory_allocated(self.dev)
+        elif self.device_type == DeviceType.MPS:
+            cur_mem = torch.mps.current_allocated_memory()
+            peak_mem = torch.mps.driver_allocated_memory()
         elif self.device_type == DeviceType.CPU:
             cur_mem = cpu_mem_stats()
             peak_mem = 0
@@ -1119,7 +1134,7 @@ class TorchDevice:
         return cur_mem, peak_mem
 
     def print_stats(self, output_file=None):
-        torch.cuda.synchronize()
+        self.synchronize()
         cur_mem, peak_mem = self.mem_stats()
 
         if output_file is not None:
@@ -1392,12 +1407,19 @@ def map_to_torch_tensor(tensor, indices):
 
 def copy_worker_func(queue, cuda_id):
     """The copy worker thread."""
-    torch.cuda.set_device(cuda_id)
+    from contextlib import nullcontext
 
-    cpu_buf = torch.empty((1 * GB,), dtype=torch.float16, pin_memory=True)
-    copy_stream = torch.cuda.Stream()
+    # Without CUDA (e.g. macOS/MPS) there is no pinned relay buffer or copy stream;
+    # the CUDA-specific branch below is never taken in that case.
+    if torch.cuda.is_available():
+        torch.cuda.set_device(cuda_id)
+        cpu_buf = torch.empty((1 * GB,), dtype=torch.float16, pin_memory=True)
+        stream_ctx = torch.cuda.stream(torch.cuda.Stream())
+    else:
+        cpu_buf = None
+        stream_ctx = nullcontext()
 
-    with torch.cuda.stream(copy_stream), torch.inference_mode():
+    with stream_ctx, torch.inference_mode():
         while True:
             item = queue.get()
             if item is None:

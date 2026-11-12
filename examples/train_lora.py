@@ -27,7 +27,11 @@ def main():
     resume.add_argument("--resume_adapter", type=Path, help="Weights only; starts a fresh optimizer")
     resume.add_argument("--resume_checkpoint", type=Path, help="Restore adapter, optimizer, step and RNG")
     parser.add_argument("--checkpoint_every", type=int, default=0, help="Optimizer steps; 0 saves only at the end")
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--device",
+        default="cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu",
+        help="Client device (default: cuda, else mps, else cpu)",
+    )
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--seq_len", type=int, default=128)
     parser.add_argument("--batch_size", type=int, default=1)

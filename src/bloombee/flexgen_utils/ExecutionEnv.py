@@ -19,6 +19,8 @@ class ExecutionEnv:
         # For CPU-only mode, use CPU for all devices including 'gpu' slot
         if device_type == "cpu":
             gpu = TorchDevice("cpu")  # Use CPU for the 'gpu' slot
+        elif device_type == "mps":
+            gpu = TorchDevice("mps")  # Apple GPU
         else:
             gpu = TorchDevice("cuda:0")
         dprint("ExecutionEnv: gpu ", gpu)
