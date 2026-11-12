@@ -33,6 +33,12 @@ def main():
         help="Client device (default: cuda, else mps, else cpu)",
     )
     parser.add_argument("--steps", type=int, default=100)
+    fault = parser.add_argument_group("fault tolerance (worker failure handling)")
+    fault.add_argument("--max_retries", type=int, default=1, help="Retries per failed worker call; 0 = retry forever")
+    fault.add_argument("--request_timeout", type=float, default=300, help="Seconds before a worker request counts as failed")
+    fault.add_argument("--connect_timeout", type=float, default=30, help="Seconds to wait when opening a connection")
+    fault.add_argument("--update_period", type=float, default=None, help="Seconds between swarm refreshes (default 60)")
+    fault.add_argument("--max_backoff", type=float, default=None, help="Cap on the wait between retries (default 60)")
     parser.add_argument("--seq_len", type=int, default=128)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
@@ -84,10 +90,14 @@ def main():
     kwargs = dict(
         initial_peers=args.initial_peers,
         torch_dtype=torch.float16,
-        request_timeout=300,
-        connect_timeout=30,
-        max_retries=1,
+        request_timeout=args.request_timeout,
+        connect_timeout=args.connect_timeout,
+        max_retries=args.max_retries or None,  # None = retry forever
     )
+    if args.update_period is not None:
+        kwargs["update_period"] = args.update_period
+    if args.max_backoff is not None:
+        kwargs["max_backoff"] = args.max_backoff
     if args.dht_prefix:
         kwargs["dht_prefix"] = args.dht_prefix
     base = AutoDistributedModelForCausalLM.from_pretrained(args.model, **kwargs).to(args.device)

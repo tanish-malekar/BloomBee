@@ -163,6 +163,7 @@ class RemoteSequenceManager:
         *,
         mode: str,
         cache_tokens_needed: Optional[int] = None,
+        peer_load: Optional[Dict[PeerID, int]] = None,
     ) -> List[RemoteSpanInfo]:
         """
         Form a sequence of remote servers that collectively serve all consecutive layers
@@ -170,6 +171,8 @@ class RemoteSequenceManager:
         :param start_index: optional index of the first module in a sequence, default = the first of block_uids
         :param end_index: optional index of the last module (non-inclusive), default = after last of block uids
         :param mode: one of ["max_throughput", "min_latency"]
+        :param peer_load: max_throughput only: the caller's in-flight requests per peer; busier peers are
+            proportionally less likely to be chosen, so concurrent requests spread over replicas
         """
         with self._thread_start_lock:
             if not self.is_alive():
@@ -184,7 +187,7 @@ class RemoteSequenceManager:
                 start_index, end_index, cache_tokens_needed=cache_tokens_needed
             )
         elif mode == "max_throughput":
-            span_sequence = self._make_sequence_with_max_throughput(start_index, end_index)
+            span_sequence = self._make_sequence_with_max_throughput(start_index, end_index, peer_load=peer_load)
         else:
             raise RuntimeError(f"Unexpected mode {mode}")
 
@@ -319,7 +322,9 @@ class RemoteSequenceManager:
         # not S * 2 * num_layers.
         return cache_tokens_needed <= span.server_info.cache_tokens_left
 
-    def _make_sequence_with_max_throughput(self, start_index: int, end_index: int) -> List[RemoteSpanInfo]:
+    def _make_sequence_with_max_throughput(
+        self, start_index: int, end_index: int, *, peer_load: Optional[Dict[PeerID, int]] = None
+    ) -> List[RemoteSpanInfo]:
         client_server_rtts = self.ping_aggregator.to_dict()
 
         span_sequence = []
@@ -336,6 +341,8 @@ class RemoteSequenceManager:
                 [span.length if client_server_rtts.get(span.peer_id) != np.inf else eps for span in candidate_spans],
                 dtype=np.float64,
             )
+            if peer_load:
+                span_weights /= 1.0 + np.array([peer_load.get(span.peer_id, 0) for span in candidate_spans])
             chosen_span = np.random.choice(candidate_spans, p=span_weights / span_weights.sum())
 
             assert chosen_span.start <= current_index < chosen_span.end

@@ -1,7 +1,9 @@
 """Client-owned standard LoRA parameters, ordinary torch optimizers, remote gradients."""
 
 import asyncio
+import itertools
 import json
+from collections import deque
 from pathlib import Path
 
 import torch
@@ -15,10 +17,13 @@ from torch import nn
 from torch.autograd.function import once_differentiable
 
 from bloombee.client.remote_sequential import RemoteSequential
+from bloombee.client.routing import maybe_log_traceback
 from bloombee.server.lora import LoRAService
-from bloombee.utils.hivemind_compat import MSGPackSerializer
+from bloombee.utils.hivemind_compat import MSGPackSerializer, get_logger
 from bloombee.utils.lora import LORA_NAMESPACE, LORA_PROTOCOL_VERSION, LoRAConfig, LoRAProjection, projection_shapes
 from bloombee.utils.lossless_transport import deserialize_tensor_stream, serialize_torch_tensor
+
+logger = get_logger(__name__)
 
 
 async def _call_lora(manager, span, inputs, metadata):
@@ -44,40 +49,168 @@ async def _call_lora(manager, span, inputs, metadata):
     return await deserialize_tensor_stream(checked())
 
 
-class _RemoteLoRAFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, inputs, manager, span, metadata, *parameters):
-        ctx.manager, ctx.span, ctx.lora_metadata = manager, span, metadata
-        ctx.save_for_backward(inputs, *parameters)
-        result = RemoteExpertWorker.run_coroutine(
-            _call_lora(manager, span, (inputs, *parameters), {**metadata, "backward": False})
+class _LoRARunner:
+    """Runs independent micro-batch chains concurrently, each over its own replica route.
+
+    Dropout seeds are keyed by absolute layer (micro-batch seed + layer index), so any span boundaries
+    reproduce the same masks. This is what makes re-routing a failed backward onto other replicas exact.
+    """
+
+    def __init__(self, manager, num_layers, width):
+        self.manager, self.num_layers, self.width = manager, num_layers, width
+        self.load = {}  # in-flight requests per peer, steers routing toward idle replicas
+        self.last_routes = []  # [(peer_id, start, end), ...] per micro-batch of the latest forward
+
+    def _route(self, start, end):
+        spans = self.manager.make_sequence(start, end, mode="max_throughput", peer_load=dict(self.load))
+        spans[-1].end = min(spans[-1].end, end)
+        return spans
+
+    def _params(self, parameters, span):
+        return parameters[span.start * self.width : span.end * self.width]
+
+    async def _call(self, span, tensors, metadata):
+        self.load[span.peer_id] = self.load.get(span.peer_id, 0) + 1
+        try:
+            return await _call_lora(self.manager, span, tensors, metadata)
+        finally:
+            self.load[span.peer_id] -= 1
+
+    async def _handle_failure(self, attempt_no, span, error, what):
+        self.manager.on_request_failure(span.peer_id if span is not None else None)
+        if attempt_no + 1 == self.manager.config.max_retries:
+            raise error
+        delay = self.manager.get_retry_delay(attempt_no)
+        logger.warning(f"LoRA {what} via {span} failed (retry in {delay:.0f} sec): {error!r}")
+        maybe_log_traceback(error)
+        await asyncio.sleep(delay)
+
+    async def _forward_span(self, span, x, seed, parameters, metadata):
+        result = await self._call(
+            span,
+            (x, *self._params(parameters, span)),
+            {**metadata, "backward": False, "seed": seed + span.start},
         )
-        if len(result) != 1 or result[0].shape != inputs.shape:
+        if len(result) != 1 or result[0].shape != x.shape:
             raise RuntimeError("Invalid remote LoRA forward response")
-        return result[0].to(inputs)
+        return result[0].to(x)
+
+    async def _backward_span(self, span, x, grad, seed, parameters, metadata):
+        params = self._params(parameters, span)
+        result = await self._call(
+            span, (x, *params, grad), {**metadata, "backward": True, "seed": seed + span.start}
+        )
+        expected = (x, *params)
+        if len(result) != len(expected) or any(g.shape != e.shape for g, e in zip(result, expected)):
+            raise RuntimeError("Invalid remote LoRA gradient response")
+        return result[0].to(x), list(result[1:])
+
+    async def chain_forward(self, x, seed, parameters, metadata, keep):
+        records, route, block, spans = [], [], 0, deque()
+        while block < self.num_layers:
+            for attempt_no in itertools.count():
+                span = None
+                try:
+                    if not spans or attempt_no >= 1:
+                        spans = deque(self._route(block, self.num_layers))
+                    span = spans.popleft()
+                    out = await self._forward_span(span, x, seed, parameters, metadata)
+                    self.manager.on_request_success(span.peer_id)
+                    break
+                except Exception as e:
+                    await self._handle_failure(attempt_no, span, e, "forward")
+            if keep:
+                records.append((span, x))
+            route.append((span.peer_id, span.start, span.end))
+            x, block = out, span.end
+        return x, records, route
+
+    async def _backward_range(self, span, x, grad, seed, parameters, metadata):
+        """Backward through [span.start, span.end); on failure re-route the range and redo it from its input."""
+        for attempt_no in itertools.count():
+            current = None
+            try:
+                sub = [span] if attempt_no == 0 else self._route(span.start, span.end)
+                inputs = [x]
+                for current in sub[:-1]:
+                    inputs.append(await self._forward_span(current, inputs[-1], seed, parameters, metadata))
+                pieces, g = {}, grad
+                for current, x_in in zip(reversed(sub), reversed(inputs)):
+                    g, pieces[current.start] = await self._backward_span(
+                        current, x_in, g, seed, parameters, metadata
+                    )
+                    self.manager.on_request_success(current.peer_id)
+                return g, pieces
+            except Exception as e:
+                await self._handle_failure(attempt_no, current, e, "backward")
+
+    async def chain_backward(self, records, grad, seed, parameters, metadata):
+        pieces = {}
+        for span, x in reversed(records):
+            grad, got = await self._backward_range(span, x, grad, seed, parameters, metadata)
+            pieces.update(got)
+        return grad, [g for start in sorted(pieces) for g in pieces[start]]
+
+    async def gather_forward(self, batches, seeds, parameters, metadata, keep):
+        return await asyncio.gather(
+            *[self.chain_forward(b, s, parameters, metadata, keep) for b, s in zip(batches, seeds)]
+        )
+
+    async def gather_backward(self, records, grads, seeds, parameters, metadata):
+        return await asyncio.gather(
+            *[self.chain_backward(r, g, s, parameters, metadata) for r, g, s in zip(records, grads, seeds)]
+        )
+
+
+class _RemoteLoRASequenceFunction(torch.autograd.Function):
+    """Whole-sequence remote LoRA. Micro-batches run concurrently; their A/B gradients are summed."""
+
+    @staticmethod
+    def forward(ctx, inputs, runner, micro_batch_size, metadata, *parameters):
+        batches = [b.cpu() for b in inputs.detach().split(micro_batch_size or len(inputs))]
+        seeds = [int(torch.randint(0, 2**31, (), device="cpu")) for _ in batches]
+        cpu_params = tuple(p.detach().cpu() for p in parameters)
+        keep = any(ctx.needs_input_grad)
+        results = RemoteExpertWorker.run_coroutine(runner.gather_forward(batches, seeds, cpu_params, metadata, keep))
+        runner.last_routes = [r[2] for r in results]
+        # save_for_backward enforces PyTorch's version check: do not optimizer.step
+        # between this forward and backward (including multiple in-flight batches).
+        ctx.save_for_backward(inputs, *parameters)
+        ctx.runner, ctx.lora_metadata, ctx.seeds = runner, metadata, seeds
+        ctx.sizes, ctx.records = [len(b) for b in batches], [r[1] for r in results]
+        return torch.cat([r[0] for r in results]).to(device=inputs.device, dtype=inputs.dtype)
 
     @staticmethod
     @once_differentiable
     def backward(ctx, grad_outputs):
-        # save_for_backward enforces PyTorch's version check: do not optimizer.step
-        # between this forward and backward (including multiple in-flight batches).
         inputs, *parameters = ctx.saved_tensors
-        gradients = RemoteExpertWorker.run_coroutine(
-            _call_lora(
-                ctx.manager, ctx.span, (inputs, *parameters, grad_outputs), {**ctx.lora_metadata, "backward": True}
-            )
+        cpu_params = tuple(p.detach().cpu() for p in parameters)
+        grads = grad_outputs.cpu().split(ctx.sizes)
+        results = RemoteExpertWorker.run_coroutine(
+            ctx.runner.gather_backward(ctx.records, grads, ctx.seeds, cpu_params, ctx.lora_metadata)
         )
-        expected = (inputs, *parameters)
-        if len(gradients) != len(expected) or any(g.shape != p.shape for g, p in zip(gradients, expected)):
-            raise RuntimeError("Invalid remote LoRA gradient response")
-        gradients = [g.to(p) for g, p in zip(gradients, expected)]
-        return gradients[0], None, None, None, *gradients[1:]
+        grad_inputs = torch.cat([r[0] for r in results]).to(inputs)
+        totals = []
+        for i, p in enumerate(parameters):
+            total = results[0][1][i].clone()
+            for r in results[1:]:
+                total += r[1][i]
+            totals.append(total.to(p))
+        return grad_inputs, None, None, None, *totals
+
+
+def _check_micro_batch_size(value):
+    if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+        raise ValueError("micro_batch_size must be a positive integer or None")
 
 
 class LoRARemoteSequential(RemoteSequential):
-    def __init__(self, original, lora_config):
+    def __init__(self, original, lora_config, micro_batch_size=None):
         super().__init__(original.config, sequence_manager=original.sequence_manager)
+        _check_micro_batch_size(micro_batch_size)
         self.lora_config = lora_config
+        self.micro_batch_size = micro_batch_size
+        self._runner = _LoRARunner(self.sequence_manager, len(original), 2 * len(lora_config.target_modules))
         shapes = projection_shapes(original.config)
         self.adapters = nn.ModuleList(
             [
@@ -104,22 +237,14 @@ class LoRARemoteSequential(RemoteSequential):
                 raise ValueError(f"LoRA does not support {name}")
         if inputs.ndim != 3 or inputs.shape[-1] != self.config.hidden_size:
             raise ValueError("LoRA expects [batch, sequence, hidden_size]")
-        route = self.sequence_manager.make_sequence(mode="max_throughput")
-        for span in route:
-            parameters = tuple(
-                p
-                for layer in self.adapters[span.start : span.end]
-                for name in self.lora_config.target_modules
-                for p in (layer[name].lora_A, layer[name].lora_B)
-            )
-            metadata = dict(
-                version=LORA_PROTOCOL_VERSION,
-                config=self.lora_config.to_dict(),
-                training=self.training,
-                seed=int(torch.randint(0, 2**31, (), device="cpu")),
-            )
-            inputs = _RemoteLoRAFunction.apply(inputs, self.sequence_manager, span, metadata, *parameters)
-        return inputs
+        parameters = tuple(
+            p
+            for layer in self.adapters
+            for name in self.lora_config.target_modules
+            for p in (layer[name].lora_A, layer[name].lora_B)
+        )
+        metadata = dict(version=LORA_PROTOCOL_VERSION, config=self.lora_config.to_dict(), training=self.training)
+        return _RemoteLoRASequenceFunction.apply(inputs, self._runner, self.micro_batch_size, metadata, *parameters)
 
     def inference_session(self, **kwargs):
         raise ValueError("Use DistributedLoRA.generate for full-prefix LoRA inference; remote KV is not adapter-aware")
@@ -136,7 +261,9 @@ class DistributedLoRA(nn.Module):
     weights are sent again at backward; there is no worker-side optimizer step.
     """
 
-    def __init__(self, model, config=None):
+    def __init__(self, model, config=None, *, micro_batch_size=None):
+        """micro_batch_size: split each batch into chunks of this many rows and run them concurrently
+        over replica routes (None = whole batch in one chain). Gradients are summed, so results match."""
         super().__init__()
         self.lora_config = config or LoRAConfig()
         if not isinstance(self.lora_config, LoRAConfig):
@@ -154,7 +281,7 @@ class DistributedLoRA(nn.Module):
             raise ValueError("Attach LoRA to the complete model layer sequence")
         model.requires_grad_(False)
         parent_path, _, attribute = name.rpartition(".")
-        sequence = LoRARemoteSequential(original, self.lora_config)
+        sequence = LoRARemoteSequential(original, self.lora_config, micro_batch_size)
         setattr(model.get_submodule(parent_path), attribute, sequence)
         self.model = model
         self._sequence_path = name
@@ -294,7 +421,7 @@ class DistributedLoRA(nn.Module):
         return {"step": state["step"], "metadata": state["metadata"]}
 
     @classmethod
-    def from_pretrained(cls, model, directory):
+    def from_pretrained(cls, model, directory, *, micro_batch_size=None):
         path = Path(directory)
         config = json.loads((path / "adapter_config.json").read_text())
         if (
@@ -309,7 +436,11 @@ class DistributedLoRA(nn.Module):
             or config.get("lora_bias", False)
         ):
             raise ValueError("Only standard bias-free alpha/r LoRA adapters are supported")
-        result = cls(model, LoRAConfig(**{k: config[k] for k in ("r", "lora_alpha", "lora_dropout", "target_modules")}))
+        result = cls(
+            model,
+            LoRAConfig(**{k: config[k] for k in ("r", "lora_alpha", "lora_dropout", "target_modules")}),
+            micro_batch_size=micro_batch_size,
+        )
         expected, state = result._adapter_state(), load_file(str(path / "adapter_model.safetensors"))
         if set(expected) != set(state) or any(expected[k].shape != state[k].shape for k in expected):
             raise ValueError("LoRA checkpoint keys/shapes do not match this model")
