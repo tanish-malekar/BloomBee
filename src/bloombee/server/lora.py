@@ -19,6 +19,27 @@ def lora_enabled():
     return os.getenv("BLOOMBEE_ENABLE_LORA", "0") == "1"
 
 
+def _weights_compressed(block) -> bool:
+    try:
+        from bloombee.flexgen_utils.pytorch_backend import DeviceType
+        return block.weight_home[0].val[0].device.device_type == DeviceType.COMPRESSED
+    except Exception:
+        return False
+
+
+_CACHE_SLACK_BYTES = int(os.getenv("BLOOMBEE_QLORA_CACHE_SLACK_MB", "256")) << 20
+
+
+def _release_cached_memory(device) -> None:
+    """Return cached-but-unused allocator memory once it exceeds a small slack (emptying every call is slow)."""
+    if device.type == "mps":
+        if torch.mps.driver_allocated_memory() - torch.mps.current_allocated_memory() > _CACHE_SLACK_BYTES:
+            torch.mps.empty_cache()
+    elif device.type == "cuda":
+        if torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device) > _CACHE_SLACK_BYTES:
+            torch.cuda.empty_cache()
+
+
 def run_lora_block(backend, inputs, grad_outputs, metadata, *parameters):
     """Recompute a frozen block and return dX, dA, dB without accumulating worker .grad."""
     config = LoRAConfig(**metadata["config"])
@@ -65,9 +86,15 @@ def run_lora_block(backend, inputs, grad_outputs, metadata, *parameters):
         output = backend.module(x)
         output = output[0] if isinstance(output, tuple) else output
         if not backward:
-            return (output.detach().to(dtype=inputs.dtype),)
-        gradients = torch.autograd.grad(output, (x, *params), grad_outputs.to(output), allow_unused=False)
-    return (gradients[0].detach().to(dtype=inputs.dtype), *(g.detach() for g in gradients[1:]))
+            result = (output.detach().to(dtype=inputs.dtype),)
+        else:
+            gradients = torch.autograd.grad(output, (x, *params), grad_outputs.to(output), allow_unused=False)
+            result = (gradients[0].detach().to(dtype=inputs.dtype), *(g.detach() for g in gradients[1:]))
+    if backward and _weights_compressed(block):
+        # Decompressed float16 weights are transient; without this the caching allocator keeps every
+        # freed buffer and the worker's footprint ends up above the uncompressed model's.
+        _release_cached_memory(output.device)
+    return result
 
 
 class LoRAService(ServicerBase):

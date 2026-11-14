@@ -109,8 +109,32 @@ def lora_delta(inputs, projection):
     return F.linear(F.linear(hidden, a), b) * (config.lora_alpha / config.r)
 
 
-def lora_linear(inputs, weight, projection):
-    output = F.linear(inputs, weight)
+class _FrozenCompressedLinear(torch.autograd.Function):
+    """y = x W^T for a frozen weight that is stored compressed (4-bit) and was decompressed for this call.
+
+    Plain F.linear would make autograd keep the decompressed float16 W of every layer until backward, which costs
+    more memory than the uncompressed model. This keeps only the compressed handle and decompresses W again in
+    backward, so at most one layer's float16 weight is alive at a time."""
+
+    @staticmethod
+    def forward(ctx, inputs, weight, source):
+        ctx.source = source
+        return F.linear(inputs, weight)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if not ctx.needs_input_grad[0]:
+            return None, None, None
+        weight = ctx.source.device.decompress(ctx.source)
+        return grad_output.matmul(weight.to(grad_output.dtype)), None, None
+
+
+def lora_linear(inputs, weight, projection, source=None):
+    """`source`: the compressed weight `weight` was decompressed from (None for uncompressed weights)."""
+    if source is not None and torch.is_grad_enabled() and inputs.requires_grad:
+        output = _FrozenCompressedLinear.apply(inputs, weight, source)
+    else:
+        output = F.linear(inputs, weight)
     delta = lora_delta(inputs, projection)
     return output if delta is None else output + delta.to(output.dtype)
 

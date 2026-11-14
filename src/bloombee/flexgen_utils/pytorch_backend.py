@@ -163,6 +163,11 @@ def _on_accelerator(t):
     return t.device.type in ("cuda", "mps")
 
 
+
+def _compressed_source(weight):
+    """The compressed weight handle (for memory-light LoRA backward), or None if `weight` is not compressed."""
+    return weight if weight.device.device_type == DeviceType.COMPRESSED else None
+
 class TorchTensor:
     """
     Wrap pytorch tensors to support
@@ -675,6 +680,7 @@ class TorchDevice:
     def mha_llama(self, hidden_states, attention_mask, w_q, w_k, w_v, w_out, num_attention_heads, donate, compress_cache, comp_config, input_layernorm, rotary_emb_inv_freq, rotary_position_ids, rms_norm_eps=1e-5):
         """Multi-head attention (prefill phase)."""
         
+        src_q, src_k, src_v, src_out = map(_compressed_source, (w_q, w_k, w_v, w_out))
         if w_q.device.device_type == DeviceType.COMPRESSED:
             w_q = w_q.device.decompress(w_q)
             w_k = w_k.device.decompress(w_k)
@@ -702,9 +708,9 @@ class TorchDevice:
         
         hidden = rms_norm(hidden_states.data, input_layernorm.data, variance_epsilon=rms_norm_eps)
         
-        q = lora_linear(hidden, w_q.data, "q_proj")
-        k = lora_linear(hidden, w_k.data, "k_proj")
-        v = lora_linear(hidden, w_v.data, "v_proj")
+        q = lora_linear(hidden, w_q.data, "q_proj", src_q)
+        k = lora_linear(hidden, w_k.data, "k_proj", src_k)
+        v = lora_linear(hidden, w_v.data, "v_proj", src_v)
         
         q = q.view(bsz, q_len, num_attention_heads, head_dim)
         k = k.view(bsz, q_len, num_kv_heads, head_dim)
@@ -736,7 +742,7 @@ class TorchDevice:
         value = torch.bmm(attn_weights, v).view(bsz, num_attention_heads, q_len, head_dim)
         value = value.transpose(1, 2).reshape(bsz, q_len, qkv_hidden_size)
 
-        value = lora_linear(value, w_out.data, "o_proj")
+        value = lora_linear(value, w_out.data, "o_proj", src_out)
         value.add_(hidden_states.data)
         
         if donate[0]: hidden_states.delete()
@@ -759,6 +765,7 @@ class TorchDevice:
         """Multi-head attention (decoding phase)."""
         global _MHA_GEN_DECODE_PROBE_EMITTED, _MHA_GEN_DECODE_BRANCH_PROBE_EMITTED
         # decompress weights
+        src_q, src_k, src_v, src_out = map(_compressed_source, (w_q, w_k, w_v, w_out))
         if w_q.device.device_type == DeviceType.COMPRESSED:
             w_q = w_q.device.decompress(w_q)
             w_k = w_k.device.decompress(w_k)
@@ -788,9 +795,9 @@ class TorchDevice:
         # logger.info(f"after norm, hidden states: {hidden}")
         
         # shape: (b, 1, h)
-        q = lora_linear(hidden, w_q.data, "q_proj")
-        k = lora_linear(hidden, w_k.data, "k_proj")
-        v = lora_linear(hidden, w_v.data, "v_proj")
+        q = lora_linear(hidden, w_q.data, "q_proj", src_q)
+        k = lora_linear(hidden, w_k.data, "k_proj", src_k)
+        v = lora_linear(hidden, w_v.data, "v_proj", src_v)
         
         # shape: (b, 1, n_head, head_dim) for q; (b, 1, n_kv, head_dim) for k/v
         q = q.view(b, tgt_s, n_head, head_dim)
@@ -929,7 +936,7 @@ class TorchDevice:
         # shape: (b, 1, h)
         value = value.permute(0, 2, 1, 3).contiguous().view(b, tgt_s, qkv_hidden_size)
         
-        value = lora_linear(value, w_out.data, "o_proj")
+        value = lora_linear(value, w_out.data, "o_proj", src_out)
 
         value.add_(inputs.data)
         
@@ -1090,6 +1097,7 @@ class TorchDevice:
         return TorchTensor.create_from_torch(out, self)
 
     def mlp_llama(self, inputs, gate, down, up, donate, config, post_attention_layernorm):
+        src_gate, src_down, src_up = map(_compressed_source, (gate, down, up))
         if gate.device.device_type == DeviceType.COMPRESSED:
             gate = gate.device.decompress(gate)
             down = down.device.decompress(down)
@@ -1104,8 +1112,8 @@ class TorchDevice:
         )
         # src_out = F.layer_norm(inputs.data, (h,), weight=post_attention_layernorm.data)
         out = lora_linear(
-            act_fn(lora_linear(src_out, gate.data, "gate_proj"))
-            * lora_linear(src_out, up.data, "up_proj"), down.data, "down_proj"
+            act_fn(lora_linear(src_out, gate.data, "gate_proj", src_gate))
+            * lora_linear(src_out, up.data, "up_proj", src_up), down.data, "down_proj", src_down
         )
 
         out.add_(inputs.data)

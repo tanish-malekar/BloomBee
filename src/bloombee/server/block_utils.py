@@ -89,6 +89,10 @@ def get_block_size(
         dtype = resolve_block_dtype(config, dtype)
         bytes_per_value = get_size_in_bytes(dtype)
         if quant_type == QuantType.NONE:
+            if policy is not None and getattr(policy, "compress_weight", False):
+                # FlexGen 4-bit group quantization: 4 bits per value plus an fp16 (scale, min) pair per group.
+                group = policy.comp_weight_config.group_size
+                return round(n_params * (0.5 + 4.0 / group) * (1 + eps))
             return round(n_params * bytes_per_value * (1 + eps))
         if quant_type is not QuantType.INT8 or config.block_class is not WrappedDeepseekV3Block:
             raise ValueError(

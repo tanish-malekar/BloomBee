@@ -73,6 +73,11 @@ def main():
                         help='Weight quantization type. Currently only INT8 is supported, and only for '
                              "DeepSeek-V3's MoE expert weights (~98%% of its params) -- see convert_block().")
 
+    parser.add_argument('--compress_weight', action='store_true',
+                        help='Keep the frozen block weights in 4-bit (FlexGen group-wise quantization, groups of 64) '
+                             'and decompress each layer to float16 for compute. Used for QLoRA-style training and '
+                             'memory-light serving.')
+
     parser.add_argument('--num_handlers', type=int, default=8, required=False,
                         help='server will use this many processes to handle incoming requests')
     parser.add_argument('--prefetch_batches', type=int, default=1, required=False,

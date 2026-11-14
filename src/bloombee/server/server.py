@@ -141,6 +141,7 @@ class Server:
         mean_block_selection_delay: float = 5,
         token: Optional[Union[str, bool]] = None,
         quant_type: Optional[QuantType] = None,
+        compress_weight: bool = False,
         tensor_parallel_devices: Optional[Sequence[torch.device]] = None,
         skip_reachability_check: bool = False,
         reachable_via_relay: Optional[bool] = None,
@@ -326,7 +327,7 @@ class Server:
             100, 0,                   # act_gpu_percent, act_cpu_percent (mixed activation offload is unsupported)
             overlap=True, sep_layer=True, pin_weight=True,
             cpu_cache_compute=False, attn_sparsity=1.0,
-            compress_weight=False,
+            compress_weight=compress_weight,
             comp_weight_config=CompressionConfig(num_bits=4, group_size=64, group_dim=0, symmetric=False),
             compress_cache=False,
             comp_cache_config=CompressionConfig(num_bits=4, group_size=64, group_dim=2, symmetric=False),
@@ -348,6 +349,8 @@ class Server:
         self.strict_block_indices, self.num_blocks = block_indices, num_blocks
         # Log compression configuration
         self.policy.log_batch_size_strategy()
+        if compress_weight:
+            logger.info("Block weights compressed to 4-bit (FlexGen group quantization, group size %d)", self.policy.comp_weight_config.group_size)
 
         self.weight_home = array_1d(self.num_blocks, ValueHolder)
         self.path = os.path.join(tempfile.gettempdir(), 'data', 'llama_weights')
